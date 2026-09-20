@@ -440,52 +440,48 @@ def get_subscription_topics(sub_id: str) -> dict:
 # ----------------------------------------------------------------------
 @app.post("/events", response_model=EventAccepted)
 def submit_event(body: EventCreate, response: Response) -> dict:
-    db: Database = app.state.db
-
-    unknown = [sid for sid in body.subscription_ids if not db.subscription_exists(sid)]
-    if unknown:
-        raise HTTPException(400, f"unknown subscription id(s): {', '.join(unknown)}")
-
-    # Store the event once; an identical re-submission is idempotent, a
-    # conflicting payload for the same event_id is rejected. An id already
-    # used by a topic publication is a cross-channel conflict as well.
+    # The idempotency decision, the cross-channel conflict check, the
+    # subscription-existence validation, the event insert and every task
+    # insert commit in ONE SQLite transaction (db.submit_event), so
+    # concurrent requests with the same event_id serialize instead of
+    # racing separate statements: an identical replay returns the existing
+    # tasks (never a unique-key 500, never a rewritten deliver_at), a
+    # conflicting payload or a concurrent topic publication is a stable
+    # 409, and a rejected request leaves no event row or partial tasks.
     payload = json.dumps(body.payload, separators=(",", ":"), ensure_ascii=False)
-    if db.topic_event_exists(body.event_id):
-        raise HTTPException(
-            409,
-            f"event {body.event_id!r} already exists as a topic publication; "
-            "topic events and direct events share the event id namespace",
-        )
-    existing = db.get_event_payload(body.event_id)
-    if existing is None:
-        db.create_event(body.event_id, payload)
-    elif existing != payload:
-        raise HTTPException(409, f"event {body.event_id!r} already exists with a different payload")
 
-    # Optional scheduled delivery. Stored as epoch seconds and seeded into
-    # each task's next_attempt_at, so workers simply cannot claim the tasks
-    # before this instant; None means the tasks are due right away.
+    # Optional scheduled delivery, stored as epoch seconds and seeded into
+    # each new task's next_attempt_at; None means due right away.
     deliver_at_ts = (
         body.deliver_at.astimezone(timezone.utc).timestamp()
         if body.deliver_at is not None
         else None
     )
 
-    created, duplicates = [], []
-    for sid in dict.fromkeys(body.subscription_ids):  # preserve order, drop repeats
-        task, was_created = db.create_task(
-            body.event_id, sid, config.MAX_ATTEMPTS, deliver_at=deliver_at_ts
+    status, result = app.state.db.submit_event(
+        body.event_id,
+        payload,
+        body.subscription_ids,
+        config.MAX_ATTEMPTS,
+        deliver_at=deliver_at_ts,
+    )
+    if status == "unknown":
+        raise HTTPException(400, f"unknown subscription id(s): {', '.join(result)}")
+    if status == "conflict":
+        if result == "channel":
+            raise HTTPException(
+                409,
+                f"event {body.event_id!r} already exists as a topic publication; "
+                "topic events and direct events share the event id namespace",
+            )
+        raise HTTPException(
+            409, f"event {body.event_id!r} already exists with a different payload"
         )
-        ref = {
-            "task_id": task["id"],
-            "subscription_id": sid,
-            "status": task["status"],
-            "deliver_at": _iso(task["deliver_at"]),
-        }
-        (created if was_created else duplicates).append(ref)
 
-    response.status_code = 201 if created else 200
-    return {"event_id": body.event_id, "created": created, "duplicates": duplicates}
+    response.status_code = 201 if status == "created" else 200
+    for ref in result["created"] + result["duplicates"]:
+        ref["deliver_at"] = _iso(ref["deliver_at"])
+    return result
 
 
 # ----------------------------------------------------------------------
