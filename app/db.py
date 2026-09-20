@@ -1221,6 +1221,108 @@ class Database:
             ).fetchone()
         return row["payload"] if row else None
 
+    def submit_direct_event(
+        self,
+        event_id: str,
+        payload: str,
+        subscription_ids: list[str],
+        max_attempts: int,
+        deliver_at: float | None = None,
+    ) -> tuple[str, dict | list[str] | str]:
+        """Record a direct (POST /events) event and enqueue its tasks, atomically.
+
+        Everything below runs in one BEGIN IMMEDIATE transaction, so two
+        concurrent submissions of the same event_id serialize completely:
+        the loser of the write lock re-reads the winner's committed rows
+        inside its own transaction and can never race the idempotency checks
+        or hit the events PRIMARY KEY / tasks UNIQUE constraints.
+
+        Steps, in the same order the non-atomic endpoint historically used
+        (so every sequential response status is preserved):
+          1. every named subscription must exist, else ("unknown", [ids])
+             and nothing is written;
+          2. an id already claimed by a topic publication is a cross-channel
+             conflict ("conflict", "channel") -- direct and topic events
+             share one event id namespace;
+          3. an existing direct event with a different payload is
+             ("conflict", "payload");
+          4. the event is stored once and one task per distinct subscription
+             is created with INSERT OR IGNORE against UNIQUE
+             (event_id, subscription_id). An exact replay therefore creates
+             no second task set and never rewrites the first publication's
+             deliver_at (the ignored row keeps its original schedule); new
+             subscriptions named on a replay still get tasks, carrying this
+             request's deliver_at.
+
+        deliver_at is the requested schedule (epoch seconds; None = due now)
+        and seeds next_attempt_at of newly created tasks only.
+
+        Returns ("created", receipt) | ("duplicate", receipt) |
+                ("conflict", "channel" | "payload") |
+                ("unknown", [ids]); a rolled-back conflict/unknown result
+                leaves no event row and no task rows behind.
+        """
+        now = time.time()
+        due = deliver_at if deliver_at is not None else now
+        sids = list(dict.fromkeys(subscription_ids))  # preserve order, drop repeats
+        with self._lock, self._immediate():
+            unknown = [
+                sid
+                for sid in sids
+                if self._conn.execute(
+                    "SELECT 1 FROM subscriptions WHERE id = ?", (sid,)
+                ).fetchone()
+                is None
+            ]
+            if unknown:
+                return "unknown", unknown
+
+            topic_row = self._conn.execute(
+                "SELECT 1 FROM topic_events WHERE id = ?", (event_id,)
+            ).fetchone()
+            if topic_row is not None:
+                return "conflict", "channel"
+
+            existing = self._conn.execute(
+                "SELECT payload FROM events WHERE id = ?", (event_id,)
+            ).fetchone()
+            if existing is not None and existing["payload"] != payload:
+                return "conflict", "payload"
+
+            if existing is None:
+                self._conn.execute(
+                    "INSERT INTO events (id, payload, created_at) VALUES (?, ?, ?)",
+                    (event_id, payload, now),
+                )
+
+            created, duplicates = [], []
+            for sid in sids:
+                cur = self._conn.execute(
+                    """INSERT OR IGNORE INTO tasks
+                           (event_id, subscription_id, status, attempts, max_attempts,
+                            deliver_at, next_attempt_at, created_at, updated_at)
+                       VALUES (?, ?, 'pending', 0, ?, ?, ?, ?, ?)""",
+                    (event_id, sid, max_attempts, deliver_at, due, now, now),
+                )
+                task = self._conn.execute(
+                    "SELECT id, status, deliver_at FROM tasks "
+                    "WHERE event_id = ? AND subscription_id = ?",
+                    (event_id, sid),
+                ).fetchone()
+                ref = {
+                    "task_id": task["id"],
+                    "subscription_id": sid,
+                    "status": task["status"],
+                    # Epoch seconds (None = immediate); the API layer renders
+                    # this as ISO-8601. On a duplicate the value is the first
+                    # submission's schedule, which INSERT OR IGNORE preserved.
+                    "deliver_at": task["deliver_at"],
+                }
+                (created if cur.rowcount > 0 else duplicates).append(ref)
+
+            receipt = {"event_id": event_id, "created": created, "duplicates": duplicates}
+        return ("created" if created else "duplicate"), receipt
+
     def create_event(self, event_id: str, payload: str) -> None:
         with self._lock, self._immediate():
             self._conn.execute(
